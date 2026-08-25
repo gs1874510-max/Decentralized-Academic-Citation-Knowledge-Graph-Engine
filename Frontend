@@ -1,0 +1,386 @@
+/**
+ * Academic Knowledge Graph Engine - Frontend Dashboard
+ * React component for uploading papers and querying the knowledge graph
+ */
+
+import React, { useState, useEffect } from 'react';
+import { Upload, Search, Users, BarChart3, Loader } from 'lucide-react';
+
+const KnowledgeGraphDashboard = () => {
+  const [apiUrl, setApiUrl] = useState('');
+  const [activeTab, setActiveTab] = useState('upload');
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+
+  // Upload state
+  const [uploadForm, setUploadForm] = useState({
+    file: null,
+    title: '',
+    department: '',
+  });
+
+  // Search state
+  const [searchForm, setSearchForm] = useState({
+    type: 'collaborations',
+    query: '',
+  });
+
+  const [results, setResults] = useState([]);
+
+  // Handle file upload
+  const handleFileChange = (e) => {
+    setUploadForm({ ...uploadForm, file: e.target.files[0] });
+  };
+
+  const handleUploadChange = (field, value) => {
+    setUploadForm({ ...uploadForm, [field]: value });
+  };
+
+  const submitPaper = async (e) => {
+    e.preventDefault();
+    if (!apiUrl) {
+      setMessage('❌ Please enter your Cloud Run API URL');
+      return;
+    }
+    if (!uploadForm.file) {
+      setMessage('❌ Please select a PDF file');
+      return;
+    }
+
+    setLoading(true);
+    const formData = new FormData();
+    formData.append('file', uploadForm.file);
+    formData.append('title', uploadForm.title || uploadForm.file.name);
+    formData.append('department', uploadForm.department);
+
+    try {
+      const response = await fetch(`${apiUrl}/upload-paper`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setMessage(
+          `✅ Success! Extracted ${data.entities_extracted} entities and ${data.relationships_extracted} relationships`
+        );
+        setUploadForm({ file: null, title: '', department: '' });
+      } else {
+        setMessage(`❌ Error: ${response.statusText}`);
+      }
+    } catch (error) {
+      setMessage(`❌ Connection error: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSearch = async (e) => {
+    e.preventDefault();
+    if (!apiUrl) {
+      setMessage('❌ Please enter your Cloud Run API URL');
+      return;
+    }
+    if (!searchForm.query) {
+      setMessage('❌ Please enter a search query');
+      return;
+    }
+
+    setLoading(true);
+    setResults([]);
+
+    try {
+      let endpoint = '';
+      if (searchForm.type === 'collaborations') {
+        endpoint = `/search-collaborations?author=${encodeURIComponent(searchForm.query)}`;
+      } else if (searchForm.type === 'similar') {
+        endpoint = `/find-similar-papers?paper_title=${encodeURIComponent(searchForm.query)}`;
+      }
+
+      const response = await fetch(`${apiUrl}${endpoint}`);
+
+      if (response.ok) {
+        const data = await response.json();
+        setResults(data);
+        setMessage('');
+      } else {
+        setMessage(`❌ Search error: ${response.statusText}`);
+      }
+    } catch (error) {
+      setMessage(`❌ Search failed: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
+      {/* Header */}
+      <div className="bg-black/40 backdrop-blur-sm border-b border-purple-500/20 sticky top-0 z-50">
+        <div className="max-w-6xl mx-auto px-6 py-6">
+          <h1 className="text-4xl font-bold text-white mb-2">
+            🧠 Academic Knowledge Graph
+          </h1>
+          <p className="text-purple-300/80 text-sm">
+            Discover hidden research connections across your institution
+          </p>
+        </div>
+      </div>
+
+      {/* Configuration */}
+      <div className="bg-purple-900/20 border-b border-purple-500/10 p-4 sticky top-20 z-40">
+        <div className="max-w-6xl mx-auto">
+          <input
+            type="text"
+            placeholder="Enter Cloud Run Service URL (e.g., https://knowledge-graph-xxx.run.app)"
+            value={apiUrl}
+            onChange={(e) => setApiUrl(e.target.value)}
+            className="w-full px-4 py-2 bg-slate-800 border border-purple-500/30 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-purple-500"
+          />
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-6xl mx-auto px-6 py-8">
+        {/* Message */}
+        {message && (
+          <div className="mb-6 p-4 rounded-lg bg-purple-900/30 border border-purple-500/30 text-white/90">
+            {message}
+          </div>
+        )}
+
+        {/* Tabs */}
+        <div className="flex gap-2 mb-8 border-b border-purple-500/20">
+          {[
+            { id: 'upload', label: '📄 Upload Papers', icon: Upload },
+            { id: 'search', label: '🔍 Find Collaborations', icon: Search },
+            { id: 'similar', label: '📊 Similar Papers', icon: BarChart3 },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => {
+                setActiveTab(tab.id);
+                setMessage('');
+                setResults([]);
+              }}
+              className={`px-6 py-3 font-medium transition ${
+                activeTab === tab.id
+                  ? 'text-purple-400 border-b-2 border-purple-400'
+                  : 'text-slate-400 hover:text-slate-300'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Upload Tab */}
+        {activeTab === 'upload' && (
+          <div className="bg-slate-800/50 border border-purple-500/20 rounded-xl p-8 backdrop-blur-sm">
+            <form onSubmit={submitPaper} className="space-y-6">
+              <div>
+                <label className="block text-white font-medium mb-3">
+                  Select PDF Paper
+                </label>
+                <div className="border-2 border-dashed border-purple-500/30 rounded-lg p-8 text-center hover:border-purple-500/50 transition cursor-pointer">
+                  <input
+                    type="file"
+                    accept=".pdf"
+                    onChange={handleFileChange}
+                    className="hidden"
+                    id="file-input"
+                  />
+                  <label htmlFor="file-input" className="cursor-pointer">
+                    <Upload className="mx-auto mb-3 text-purple-400" size={32} />
+                    <p className="text-slate-300">
+                      {uploadForm.file
+                        ? uploadForm.file.name
+                        : 'Click to select PDF or drag and drop'}
+                    </p>
+                  </label>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input
+                  type="text"
+                  placeholder="Paper Title (optional)"
+                  value={uploadForm.title}
+                  onChange={(e) => handleUploadChange('title', e.target.value)}
+                  className="px-4 py-3 bg-slate-700 border border-purple-500/20 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-purple-500"
+                />
+                <input
+                  type="text"
+                  placeholder="Department (e.g., Computer Science)"
+                  value={uploadForm.department}
+                  onChange={(e) => handleUploadChange('department', e.target.value)}
+                  className="px-4 py-3 bg-slate-700 border border-purple-500/20 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-purple-500"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full py-3 bg-gradient-to-r from-purple-600 to-purple-800 text-white font-medium rounded-lg hover:from-purple-700 hover:to-purple-900 disabled:opacity-50 transition flex items-center justify-center gap-2"
+              >
+                {loading ? (
+                  <>
+                    <Loader size={20} className="animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <Upload size={20} />
+                    Upload & Analyze Paper
+                  </>
+                )}
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* Search Collaborations Tab */}
+        {activeTab === 'search' && (
+          <div className="space-y-6">
+            <div className="bg-slate-800/50 border border-purple-500/20 rounded-xl p-8 backdrop-blur-sm">
+              <form onSubmit={handleSearch} className="space-y-4">
+                <input
+                  type="text"
+                  placeholder="Enter author name to find collaborators..."
+                  value={searchForm.query}
+                  onChange={(e) => setSearchForm({ ...searchForm, query: e.target.value })}
+                  className="w-full px-4 py-3 bg-slate-700 border border-purple-500/20 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-purple-500"
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full py-3 bg-gradient-to-r from-purple-600 to-purple-800 text-white font-medium rounded-lg hover:from-purple-700 hover:to-purple-900 disabled:opacity-50 transition flex items-center justify-center gap-2"
+                >
+                  {loading ? (
+                    <>
+                      <Loader size={20} className="animate-spin" />
+                      Searching...
+                    </>
+                  ) : (
+                    <>
+                      <Search size={20} />
+                      Find Collaborations
+                    </>
+                  )}
+                </button>
+              </form>
+            </div>
+
+            {/* Results */}
+            {results.collaborators && (
+              <div className="bg-slate-800/50 border border-purple-500/20 rounded-xl p-8 backdrop-blur-sm">
+                <h3 className="text-white text-xl font-bold mb-4">
+                  Collaborators of {results.author}
+                </h3>
+                {results.collaborators.length > 0 ? (
+                  <div className="space-y-3">
+                    {results.collaborators.map((collab, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center justify-between p-4 bg-purple-900/20 border border-purple-500/20 rounded-lg hover:border-purple-500/50 transition"
+                      >
+                        <div className="flex items-center gap-3">
+                          <Users className="text-purple-400" size={20} />
+                          <span className="text-white font-medium">{collab.author}</span>
+                        </div>
+                        <span className="bg-purple-600 text-white px-3 py-1 rounded-full text-sm">
+                          {collab.papers_together} papers
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-slate-400">No collaborators found</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Similar Papers Tab */}
+        {activeTab === 'similar' && (
+          <div className="space-y-6">
+            <div className="bg-slate-800/50 border border-purple-500/20 rounded-xl p-8 backdrop-blur-sm">
+              <form onSubmit={handleSearch} className="space-y-4">
+                <input
+                  type="text"
+                  placeholder="Enter paper title to find similar research..."
+                  value={searchForm.query}
+                  onChange={(e) => setSearchForm({ ...searchForm, query: e.target.value })}
+                  className="w-full px-4 py-3 bg-slate-700 border border-purple-500/20 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-purple-500"
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full py-3 bg-gradient-to-r from-purple-600 to-purple-800 text-white font-medium rounded-lg hover:from-purple-700 hover:to-purple-900 disabled:opacity-50 transition flex items-center justify-center gap-2"
+                >
+                  {loading ? (
+                    <>
+                      <Loader size={20} className="animate-spin" />
+                      Searching...
+                    </>
+                  ) : (
+                    <>
+                      <BarChart3 size={20} />
+                      Find Similar Papers
+                    </>
+                  )}
+                </button>
+              </form>
+            </div>
+
+            {/* Results */}
+            {results.similar_papers && (
+              <div className="bg-slate-800/50 border border-purple-500/20 rounded-xl p-8 backdrop-blur-sm">
+                <h3 className="text-white text-xl font-bold mb-4">
+                  Papers Similar to "{results.query_paper}"
+                </h3>
+                {results.similar_papers.length > 0 ? (
+                  <div className="space-y-3">
+                    {results.similar_papers.map((paper, i) => (
+                      <div
+                        key={i}
+                        className="p-4 bg-purple-900/20 border border-purple-500/20 rounded-lg hover:border-purple-500/50 transition"
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="flex-1">
+                            <p className="text-white font-medium mb-2">{paper.title}</p>
+                            <div className="w-full bg-slate-700 rounded-full h-2">
+                              <div
+                                className="bg-gradient-to-r from-purple-500 to-purple-400 h-2 rounded-full"
+                                style={{
+                                  width: `${(paper.similarity_score * 100).toFixed(0)}%`,
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <span className="text-purple-300 font-bold whitespace-nowrap">
+                            {(paper.similarity_score * 100).toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-slate-400">No similar papers found</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Footer */}
+      <div className="border-t border-purple-500/10 mt-12 py-6 text-center text-slate-400 text-sm">
+        <p>🚀 Built for PromptWars Hackathon</p>
+      </div>
+    </div>
+  );
+};
+
+export default KnowledgeGraphDashboard;
