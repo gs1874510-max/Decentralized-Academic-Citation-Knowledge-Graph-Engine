@@ -1,0 +1,506 @@
+"""
+Academic Knowledge Graph Engine - Main Backend Service
+Runs on Cloud Run, handles document ingestion and graph building
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import List, Dict, Any
+import asyncio
+from dataclasses import dataclass
+
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from google.cloud import storage
+from google.cloud import alloydb_connector
+from google.cloud.sql.connector import Connector
+import sqlalchemy
+from sqlalchemy import text
+import pypdf
+import uvicorn
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI
+app = FastAPI(title="Academic Knowledge Graph Engine")
+
+# Configuration
+PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+REGION = os.getenv("GCP_REGION", "us-central1")
+ALLOYDB_CLUSTER = os.getenv("ALLOYDB_CLUSTER")
+ALLOYDB_INSTANCE = os.getenv("ALLOYDB_INSTANCE")
+ALLOYDB_DATABASE = os.getenv("ALLOYDB_DATABASE", "knowledge_graph")
+ALLOYDB_USER = os.getenv("ALLOYDB_USER", "postgres")
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+
+# Initialize Vertex AI
+vertexai.init(project=PROJECT_ID, location=REGION)
+model = GenerativeModel("gemini-2.0-flash")
+
+# Database connector (reuse connection pool)
+connector = Connector()
+
+def get_db_connection():
+    """Get a database connection from the pool"""
+    return connector.connect(
+        ALLOYDB_CLUSTER,
+        "postgres",
+        user=ALLOYDB_USER,
+        db=ALLOYDB_DATABASE,
+        enable_iam_auth=True,
+    )
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+@dataclass
+class ExtractedEntity:
+    """Represents an extracted entity from a document"""
+    entity_type: str  # "paper", "author", "dataset", "concept"
+    name: str
+    metadata: Dict[str, Any]
+
+@dataclass
+class ExtractedRelationship:
+    """Represents a relationship between entities"""
+    source: str
+    target: str
+    relationship_type: str  # "cites", "collaborates", "uses_dataset"
+    context: str = ""
+
+class DocumentUpload(BaseModel):
+    title: str
+    department: str
+    authors: List[str]
+
+# ============================================================================
+# DOCUMENT PROCESSING
+# ============================================================================
+
+async def extract_text_from_pdf(file_content: bytes) -> str:
+    """Extract text from PDF using PyPDF"""
+    try:
+        pdf_reader = pypdf.PdfReader(file_content)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        raise HTTPException(status_code=400, detail="Failed to extract PDF text")
+
+async def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> List[str]:
+    """Split text into overlapping chunks for processing"""
+    chunks = []
+    for i in range(0, len(text), chunk_size - overlap):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+# ============================================================================
+# ENTITY EXTRACTION using Vertex AI
+# ============================================================================
+
+async def extract_entities_and_relations(text: str, document_title: str) -> tuple[List[ExtractedEntity], List[ExtractedRelationship]]:
+    """
+    Use Vertex AI Gemini to extract entities and relationships from academic paper
+    """
+    
+    extraction_prompt = f"""
+    Analyze this academic paper and extract the following in JSON format:
+    
+    {{
+        "paper": {{
+            "title": "Paper title",
+            "abstract": "Brief summary",
+            "keywords": ["keyword1", "keyword2"],
+            "research_area": "Primary research area"
+        }},
+        "authors": [
+            {{"name": "Author Name", "affiliation": "University/Dept"}}
+        ],
+        "cited_papers": [
+            {{"title": "Cited paper title", "context": "How it's cited"}}
+        ],
+        "datasets_used": [
+            {{"name": "Dataset name", "source": "Source URL/DOI"}}
+        ],
+        "methodologies": [
+            {{"name": "Method", "description": "Brief description"}}
+        ],
+        "collaborating_authors": [
+            {{"author1": "Name1", "author2": "Name2", "papers": 1}}
+        ]
+    }}
+    
+    Paper Content:
+    {text[:5000]}
+    
+    Return ONLY valid JSON, no additional text.
+    """
+    
+    try:
+        response = model.generate_content(extraction_prompt)
+        # Parse the response
+        try:
+            data = json.loads(response.text)
+            
+            # Convert to our data models
+            entities = []
+            relationships = []
+            
+            # Add paper entity
+            if "paper" in data:
+                entities.append(ExtractedEntity(
+                    entity_type="paper",
+                    name=data["paper"].get("title", document_title),
+                    metadata={
+                        "abstract": data["paper"].get("abstract"),
+                        "keywords": data["paper"].get("keywords", []),
+                        "research_area": data["paper"].get("research_area"),
+                        "ingested_at": datetime.utcnow().isoformat()
+                    }
+                ))
+            
+            # Add author entities
+            for author in data.get("authors", []):
+                entities.append(ExtractedEntity(
+                    entity_type="author",
+                    name=author["name"],
+                    metadata={"affiliation": author.get("affiliation")}
+                ))
+                
+                # Create paper-author relationship
+                relationships.append(ExtractedRelationship(
+                    source=author["name"],
+                    target=document_title,
+                    relationship_type="authored",
+                    context="Author of this paper"
+                ))
+            
+            # Add cited papers as relationships
+            for cited in data.get("cited_papers", []):
+                relationships.append(ExtractedRelationship(
+                    source=document_title,
+                    target=cited["title"],
+                    relationship_type="cites",
+                    context=cited.get("context", "")
+                ))
+            
+            # Add dataset entities and relationships
+            for dataset in data.get("datasets_used", []):
+                entities.append(ExtractedEntity(
+                    entity_type="dataset",
+                    name=dataset["name"],
+                    metadata={"source": dataset.get("source")}
+                ))
+                relationships.append(ExtractedRelationship(
+                    source=document_title,
+                    target=dataset["name"],
+                    relationship_type="uses_dataset",
+                    context=""
+                ))
+            
+            # Add methodology entities
+            for method in data.get("methodologies", []):
+                entities.append(ExtractedEntity(
+                    entity_type="methodology",
+                    name=method["name"],
+                    metadata={"description": method.get("description")}
+                ))
+                relationships.append(ExtractedRelationship(
+                    source=document_title,
+                    target=method["name"],
+                    relationship_type="uses_methodology",
+                    context=""
+                ))
+            
+            return entities, relationships
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}, Response: {response.text}")
+            return [], []
+            
+    except Exception as e:
+        logger.error(f"Entity extraction error: {e}")
+        return [], []
+
+# ============================================================================
+# EMBEDDING GENERATION
+# ============================================================================
+
+async def generate_embedding(text: str) -> List[float]:
+    """Generate embedding for text using Vertex AI"""
+    try:
+        from vertexai.language_models import TextEmbeddingModel
+        
+        model = TextEmbeddingModel.from_pretrained("textembedding-gecko@003")
+        embeddings = model.get_embeddings([text])
+        return embeddings[0].values
+        
+    except Exception as e:
+        logger.error(f"Embedding generation error: {e}")
+        return []
+
+# ============================================================================
+# DATABASE OPERATIONS
+# ============================================================================
+
+def init_database():
+    """Initialize AlloyDB schema"""
+    schema_sql = """
+    -- Create extension for vector search
+    CREATE EXTENSION IF NOT EXISTS vector;
+    
+    -- Papers table
+    CREATE TABLE IF NOT EXISTS papers (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(500) NOT NULL UNIQUE,
+        abstract TEXT,
+        department VARCHAR(200),
+        keywords TEXT[],
+        research_area VARCHAR(200),
+        embedding vector(768),
+        doi VARCHAR(100),
+        ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Authors table
+    CREATE TABLE IF NOT EXISTS authors (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(300) NOT NULL UNIQUE,
+        affiliation VARCHAR(300),
+        email VARCHAR(200),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Paper-Author junction
+    CREATE TABLE IF NOT EXISTS paper_authors (
+        paper_id INT REFERENCES papers(id),
+        author_id INT REFERENCES authors(id),
+        PRIMARY KEY (paper_id, author_id)
+    );
+    
+    -- Datasets table
+    CREATE TABLE IF NOT EXISTS datasets (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(300) NOT NULL UNIQUE,
+        source VARCHAR(500),
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Relationships/Edges
+    CREATE TABLE IF NOT EXISTS relationships (
+        id SERIAL PRIMARY KEY,
+        source_entity VARCHAR(500) NOT NULL,
+        target_entity VARCHAR(500) NOT NULL,
+        relationship_type VARCHAR(100) NOT NULL,
+        context TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Create indexes
+    CREATE INDEX IF NOT EXISTS idx_papers_department ON papers(department);
+    CREATE INDEX IF NOT EXISTS idx_papers_embedding ON papers USING ivfflat(embedding vector_cosine_ops);
+    CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships(relationship_type);
+    CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_entity);
+    """
+    
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            for statement in schema_sql.split(';'):
+                if statement.strip():
+                    cursor.execute(statement)
+            conn.commit()
+        logger.info("Database schema initialized")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+
+async def save_entities_to_db(entities: List[ExtractedEntity], relationships: List[ExtractedRelationship]):
+    """Save extracted entities and relationships to AlloyDB"""
+    conn = get_db_connection()
+    
+    try:
+        with conn.cursor() as cursor:
+            for entity in entities:
+                if entity.entity_type == "paper":
+                    cursor.execute("""
+                        INSERT INTO papers (title, abstract, keywords, research_area, department)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (title) DO NOTHING
+                    """, (
+                        entity.name,
+                        entity.metadata.get("abstract"),
+                        entity.metadata.get("keywords"),
+                        entity.metadata.get("research_area"),
+                        entity.metadata.get("department")
+                    ))
+                
+                elif entity.entity_type == "author":
+                    cursor.execute("""
+                        INSERT INTO authors (name, affiliation)
+                        VALUES (%s, %s)
+                        ON CONFLICT (name) DO NOTHING
+                    """, (entity.name, entity.metadata.get("affiliation")))
+            
+            for rel in relationships:
+                cursor.execute("""
+                    INSERT INTO relationships (source_entity, target_entity, relationship_type, context)
+                    VALUES (%s, %s, %s, %s)
+                """, (rel.source, rel.target, rel.relationship_type, rel.context))
+        
+        conn.commit()
+        logger.info(f"Saved {len(entities)} entities and {len(relationships)} relationships")
+        
+    except Exception as e:
+        logger.error(f"Database save error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.post("/upload-paper")
+async def upload_paper(
+    file: UploadFile = File(...),
+    title: str = None,
+    department: str = None,
+    authors: str = None
+):
+    """
+    Upload a PDF paper and process it for the knowledge graph
+    """
+    try:
+        # Read PDF
+        file_content = await file.read()
+        text = await extract_text_from_pdf(file_content)
+        
+        # Use filename if title not provided
+        doc_title = title or file.filename.replace(".pdf", "")
+        
+        # Extract entities and relationships
+        entities, relationships = await extract_entities_and_relations(text, doc_title)
+        
+        # Generate embedding for the paper
+        abstract = next((e.metadata.get("abstract") for e in entities if e.entity_type == "paper"), text[:500])
+        
+        # Save to database
+        await save_entities_to_db(entities, relationships)
+        
+        return {
+            "status": "success",
+            "title": doc_title,
+            "entities_extracted": len(entities),
+            "relationships_extracted": len(relationships),
+            "message": "Paper processed and added to knowledge graph"
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/search-collaborations")
+async def search_collaborations(author: str = None, department: str = None):
+    """
+    Find research collaborations and cross-disciplinary connections
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            if author:
+                # Find papers by author and their co-authors
+                cursor.execute("""
+                    SELECT DISTINCT a2.name, COUNT(*) as collaboration_count
+                    FROM paper_authors pa1
+                    JOIN authors a1 ON pa1.author_id = a1.id
+                    JOIN paper_authors pa2 ON pa1.paper_id = pa2.paper_id
+                    JOIN authors a2 ON pa2.author_id = a2.id
+                    WHERE a1.name = %s AND a2.name != %s
+                    GROUP BY a2.name
+                    ORDER BY collaboration_count DESC
+                """, (author, author))
+                
+                collaborators = [{"author": row[0], "papers_together": row[1]} for row in cursor.fetchall()]
+                return {"author": author, "collaborators": collaborators}
+            
+            elif department:
+                # Find cross-department collaborations
+                cursor.execute("""
+                    SELECT pa1.paper_id, COUNT(DISTINCT pa1.author_id) as dept1_authors,
+                           COUNT(DISTINCT pa2.author_id) as dept2_authors
+                    FROM paper_authors pa1
+                    JOIN paper_authors pa2 ON pa1.paper_id = pa2.paper_id
+                    WHERE pa1.author_id != pa2.author_id
+                    LIMIT 20
+                """)
+                
+                collaborations = [
+                    {"paper_id": row[0], "authors_involved": row[1] + row[2]}
+                    for row in cursor.fetchall()
+                ]
+                return {"department": department, "collaborations": collaborations}
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/find-similar-papers")
+async def find_similar_papers(paper_title: str, limit: int = 5):
+    """
+    Find similar papers using embedding similarity
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT title, 1 - (embedding <=> (
+                    SELECT embedding FROM papers WHERE title = %s
+                )) as similarity
+                FROM papers
+                WHERE title != %s
+                ORDER BY similarity DESC
+                LIMIT %s
+            """, (paper_title, paper_title, limit))
+            
+            similar_papers = [
+                {"title": row[0], "similarity_score": float(row[1])}
+                for row in cursor.fetchall()
+            ]
+            return {"query_paper": paper_title, "similar_papers": similar_papers}
+        
+    except Exception as e:
+        logger.error(f"Similarity search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    init_database()
+    logger.info("Application started")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8080)
